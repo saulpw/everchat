@@ -1,0 +1,301 @@
+#!/usr/bin/python
+
+import os.path
+import time
+import re
+import socket
+
+LOG_PATH = "."
+
+from gevent import monkey; monkey.patch_all()
+from gevent.wsgi import WSGIServer
+import gevent.server
+
+from objects import *
+
+# requires: python gevent
+
+flDebug = True
+
+g_channels = { } # [channel_name] = <Channel object>
+g_users = { } # [userauth] = <User object>
+
+def http_req(s, addr):
+    print(s, addr)
+
+def log(s):
+    print "***", s
+
+def now():
+    t = time.gmtime()[0:6]
+    return t
+
+
+class User:
+    def __init__(self, email):
+        self.email = email
+        self.channels = { } # ["ChannelName"] = "nick"
+
+    @staticmethod
+    def find(ident, chan=None):
+        """User.get(nickname, channel)
+       or  User.get(email)"""
+
+        if chan:
+            if ident in chan.members:
+                return chan.members[ident]
+        else:
+            if ident in g_users:
+                return g_users[ident]
+
+    @staticmethod
+    def create(ident):
+        u = User(ident)
+        g_users[ident] = u
+
+        return u
+
+    def notify(self, obj):
+        if self.connection:
+            self.connection.notify(obj)
+
+    def invite(self, destchan):
+        pass
+
+class Channel:
+    def __init__(self, name):
+        self.name = name
+        self.members = { }  # ["nick"] = <User object>
+        self.logfn = os.path.join(LOG_PATH, self.name + ".log")
+        self.listeners = [ LogConnection(self.logfn) ] # list of *Connection objects
+        self.contents = [ ]
+
+        context = LogContext(self.name, time.gmtime(0), g_users)
+        try:
+            for L in file(self.logfn).readlines():
+                L = L.strip()
+                if not L: continue
+                p = LogItem.parse(L, context) 
+                if not p:
+                    log("not parsed: %s" % L)
+                elif type(p) is Datestamp:
+                    context.time = p.to_time() # update context only
+                else:
+                    self.contents.append(p)
+        except IOError:
+            pass
+
+        self.lastDatestamp = context.time
+
+    def __str__(self):
+        return self.name
+
+    @staticmethod
+    def get(channame):
+        if channame not in g_channels:
+            g_channels[channame] = Channel(channame)
+        return g_channels[channame]
+
+    def getNickFromEmail(self, email):
+        user = User.get(email)
+        for nick, v in self.members.items():
+            if v is user:
+                return nick
+
+    def irc_id(self, email):
+        nick = self.getNickFromEmail(email)
+        if nick:
+            return "%s!%s" % (nick, user.email)
+
+    def notify(self, obj, conn_from=None):
+        self.maybe_datestamp()
+
+        self.contents.append(obj)
+
+        for conn in self.listeners:
+            conn.notify(obj, conn_from)
+
+    def add_connection(self, conn, nickname):
+        if nickname not in self.members:
+            self.members[nickname] = conn.user
+            self.notify(ChannelJoin(now(), self.name, conn.user, nickname))
+        else:
+            assert self.members[nickname] == conn.user
+
+        self.listeners.append(conn)
+
+        # replay past log contents
+        for L in self.contents[-5:]:
+            print L
+            conn.notify(L)
+
+
+    def maybe_datestamp(self):
+        nowYMDHMS = now()
+
+        y,month,d,h,m,s = nowYMDHMS
+
+        if nowYMDHMS[0:3] != self.lastDatestamp[0:3]: # date is different
+            self.lastDatestamp = nowYMDHMS
+            self.notify(Datestamp(nowYMDHMS))
+
+regexUrl = re.compile(r"(http://\S+)", re.IGNORECASE | re.LOCALE)
+
+class LogConnection:
+    def __init__(self, fn):
+        self.logfn = fn
+
+    def notify(self, obj, from_conn=None):
+        L = obj.serializeLog(self)
+
+        with file(self.logfn, 'a') as f:
+            f.write(L + "\n")
+
+    
+class HTTPConnection:
+    def __init__(self, c):
+        self.c = c
+
+    def notify(self, obj, from_conn=None):
+        L = obj.serializeHTML(self)
+        self.send(L)
+
+# a user that is connected with an IRC client
+class IRCConnection:
+    def __init__(self, sock, addr):
+        self.sock = sock
+        self.sock_file = sock.makefile('rw')
+        self.ip = addr[0]
+        self.user = None
+        self.nick = None
+        self.servername = "localhost"
+        self.channels = { } # ["channel_name"] = ( <Channel>, "nickname" )
+
+        log("%s: connected" % self.ip)
+
+        while True:
+            L = self.sock_file.readline().strip()
+            try:
+                if not L:
+                    break
+
+                if flDebug:
+                    print "%s> %s" % (self.nick, L)
+
+                cmd, rest = L.split(' ', 1)
+                funcname = "cmd_" + cmd
+                if funcname not in IRCConnection.__dict__:
+                    print "unhandled: ", L
+                else:
+                    cease = IRCConnection.__dict__[funcname](self, rest)
+                    if cease:
+                        break
+            except socket.error, ex:
+                log("%s: disconnected: %s" % (self.ip, ex))
+
+        log("%s: ceasing" % self.ip)
+        return
+
+    def notify(self, obj, from_conn=None):
+        L = obj.serializeIRC(self)
+        if self is not from_conn: # filter by default; use None for system/global messages
+            self.send(L)
+
+    def cmd_QUIT(self, rest):
+        self.sock.shutdown(socket.SHUT_RDWR)
+        self.sock.close()
+        self.sock_file.close()
+        return "quit"
+
+    def cmd_MODE(self, rest):
+        pass
+
+    def cmd_PING(self, rest):
+        self.send("PONG " + rest)
+
+    def cmd_NICK(self, rest):
+        if self.nick is None:
+            self.nick = rest
+        else:
+            # nickname is fixed for duration of connection
+            self.reply(433, rest) # ERR_NICKNAMEINUSE
+        
+    def cmd_USER(self, rest):
+        username, hostname, servername, realname = rest.split(' ', 3)
+        self.realname = realname[1:]
+
+        email = "%s@%s" % (username, hostname)
+        u = User.find(email)
+        if not u:
+            # initiate registration sequence
+            u = User.create(email)
+
+        self.user = u
+        self.identifier = "%s!%s" % (self.nick, email)
+        log("%s: registered: %s" % (self.ip, self.identifier))
+        self.reply(001, self.identifier) # RPL_WELCOME
+        self.reply(002, "RPL_YOURHOST")
+        self.reply(003, "RPL_CREATED")
+        self.reply(004, "RPL_MYINFO")
+
+    def cmd_MOTD(self, rest):
+        self.reply(422, "ERR_NOMOTD")
+
+    def cmd_INVITE(self, rest):
+        invitee, destchan = rest.split()
+
+        invitees = set([ invitee ])
+
+        for chan, mynick in self.channels.values():
+            for nickname, user in chan.members.items():
+                if nickname == invitee:
+                    invitees.add(user)            
+
+        if len(invitees) == 0:
+            self.reply(422, "no such nickambiguous invitee (%d possible users)" % len(invitees))
+        elif len(invitees) > 1:
+            self.reply(422, "ambiguous invitee (%d possible users)" % len(invitees))
+        else:
+            invitees.pop().invite(destchan)
+            
+
+    def cmd_PRIVMSG(self, rest):
+        dest, msg = rest.split(" ", 1)
+        if dest[0] == "#":
+            channame = dest[1:]
+            assert channame in self.channels
+            chan, mynick = self.channels[channame]
+            chan.notify(ChannelMessage(now(), mynick, channame, msg[1:]), self)
+        # else: parse for email (userauth) or nickname in one of the self.channels
+
+    def cmd_JOIN(self, rest):
+        for channame in rest.split(","):
+            channame = channame[1:] # strip leading '#'
+
+            assert channame not in self.channels
+            chan = Channel.get(channame)
+            chan.add_connection(self, self.nick)
+            self.channels[channame] = (chan, self.nick)
+
+    def cmd_PART(self, channame): # unsubscribe to channel
+        self.send(":%s PART %s" % (self.identifier, channame))
+
+    def cmd_NAMES(self, channame):
+        self.reply(353, "%s @ %s :%s" % (self.nick, channame, " ".join(channel.members.keys()))) # RPL_NAMREPLY
+        self.reply(366, "%s @ %s :%s" % (self.nick, channame)) # RPL_ENDOFNAMES
+
+    def reply(self, numcode, rest):
+        self.send(":%s %03d %s :%s" % (self.servername, numcode, self.nick, rest))
+
+    def send(self, s):
+        if not s: return
+        if flDebug:
+            print "%s< %s" % (self.nick, s)
+        self.sock.send(s + "\n")
+
+irc_server = gevent.server.StreamServer(('', 6667), IRCConnection)
+irc_server.start()
+
+http_server = WSGIServer(('', 5000), http_req)
+http_server.serve_forever()
+
