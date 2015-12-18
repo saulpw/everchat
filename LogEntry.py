@@ -1,15 +1,31 @@
 
+import time
 import re
+
+from User import User
 
 reHMS = "^(\d+:\d+:\d+)"
 
-months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+def datestamp(t):
+    return time.strftime("%Y-%m-%d  %A", time.localtime(t)) # %z for timezone
+
+def datetimestamp(t):
+    return time.strftime("%Y-%m-%d  %H:%M:%S", time.localtime(t))
+
+def timestamp(t, flSeconds=True):
+    tm = time.localtime(t)
+    if flSeconds:
+        return "%02d:%02d:%02d" % tuple(tm[3:6])
+    else:
+        return "%02d:%02d" % tuple(tm[3:5])
+       
+def duration(secs):
+    return "%d minutes" % (secs / 60)
 
 class LogContext:
-    def __init__(self, name, start_time, users):
+    def __init__(self, name, start_time):
         self.channel = name
         self.time = start_time
-        self.users = users
 
 class LogItem:
     @classmethod
@@ -32,8 +48,7 @@ class Datestamp:
             return Datestamp( (y, month, d, 0, 0, 0) )
 
     def serializeLog(self, c):
-        y,month,d,h,m,s = self.time
-        return "--- %05u-%02d-%02d UTC" % (y, month, d)
+        return "--- " + datestamp(self.time)
 
     def serializeIRC(self, c):
         pass # return "PRIVMSG #%s :%s" % self.serializeLog(c)
@@ -41,10 +56,6 @@ class Datestamp:
     def serializeHTML(self, c):
         return """<td class="date"><a class="stardate" timet="%s">%s</a>"""
 
-def timestamp(t):
-    y,m,d,h,m,s = t
-    return "%02d:%02d:%02d" % (h,m,s)
-       
 class ChannelMessage:
     def __init__(self, t, src, dest, msg):
         assert "\n" not in msg
@@ -63,14 +74,14 @@ class ChannelMessage:
             return ChannelMessage(t, nick, context.channel, rest)
 
     def serializeLog(self, log):
-        y,m,d,h,m,s = self.time
-        return "%s [%s] %s" % (timestamp(self.time), self.src, self.msg)
+        y,m,d,h,m,s = time.localtime(self.time)[0:6]
+        return "%s [%s] %s" % (timestamp(self.time, log.emit_seconds), self.src, self.msg)
 
     def serializeIRC(self, c):
         return ":%s PRIVMSG #%s :%s" % (self.src, self.dest, self.msg)
 
     def serializeHTML(self, c):
-        y,m,d,h,m,s = self.time
+        y,m,d,h,m,s = self.time[0:6]
         hrmin = "%02d:%02d" % (h,m)
 
         # spaces included for reasonable cut'n'paste
@@ -101,18 +112,21 @@ class ChannelJoin:
         g = re.match(reHMS + " \** (\S+) \((\S+)\) has joined (\S+)$", line)
         if g:
             timestr, nick, email, channame = g.groups()
-            u = context.users[email]
+            u = User.find(email)
             t = parseTime(timestr, context.time)
             
             return ChannelJoin(t, channame, u, nick)
             
 
     def serializeLog(self, f):
-        return "%s *** %s (%s) has joined %s" % (timestamp(self.time), self.nickname, self.user.email, self.channel)
+        if self.nickname not in f.users:
+            f.users[self.nickname] = self.user
+            assert f.users[self.nickname] == self.user
+            return "%s +++ %s %s" % (timestamp(self.time, f.emit_seconds), self.nickname, self.user)
 
     def serializeIRC(self, c):
         return ":%s JOIN :#%s" % (self.nickname, self.channel)
 
     def serializeHTML(self, c):
-        return ":%s JOIN :#%s" % (self.user.irc_id(), self.channel)
+        return ":%s JOIN :#%s" % (self.nickname, self.channel)
 
