@@ -9,47 +9,68 @@ class LogConnection:
     def __init__(self, channame, seconds=True):
         self.emit_seconds = seconds
         self.name = channame
-        self.year = None
+        self.fp = None
+        self.needs_date = True
 
         self.users = { }
-        self.lastMessageTime = None
-        self.convStartTime = None
-        self.fp = None
+        self.contextTime = 0
+        self.lastMessageTime = 0
+        self.last_line_blank = True
+
+    def adjustedTime(self, hour, minute):
+        tm = [ x for x in time.localtime(self.contextTime) ]
+        tm[3] = int(hour)
+        tm[4] = int(minute)
+        return time.mktime(tm)
 
     def notify(self, obj, from_conn=None):
         L = obj.serializeLog(self)
         if L:
-            self.maybe_datestamp(obj.time)
-            self.fp.write(L + "\n")
+            if isinstance(obj, ChannelMessage):
+                prev = self.lastMessageTime
 
-#        if src not in self.users:
-#            self.users[src] = [ 0, 0, 0, 0 ]  # lines, words, all letters, non-ws letters
-#        u = self.users[src]
-#        u[0] += 1
-            # tally src user with letter/word/line count
-#            u[1] += len(msg.split())
-#            u[2] += len(msg)
-#            u[3] += len([x for x in msg if not x.isspace()])
+                # maybe write a datestamp or a newline
+                ndays = int(obj.time - prev) / (3600*24)
+                if ndays > 0 and prev > 0:
+                    if ndays > 1:
+                        self.writeline("      ... %s days ..." % ndays)
+                elif obj.time - prev > 15*60:
+                    self.writeline()
 
-    def filename(self, year=None):
-        if year:
-            return os.path.join(LOG_PATH, "%s-%04d.chatlog" % (self.name, year))
+                if time.localtime(obj.time)[0:3] != time.localtime(prev)[0:3]:
+                    assert time.localtime(obj.time)[0:3] > time.localtime(prev)[0:3]
+                    self.needs_date = True
+
+                self.writeline(L)
+                self.lastMessageTime = obj.time
+            else:
+                self.writeline(L)
+
+    def datestamp(self, t=None):
+        t = self.contextTime
+        self.writeline(Datestamp(t).serializeLog(self))
+
+    def set_time(self, t):
+        self.contextTime = t
+
+    def writeline(self, L=""):
+        if not self.fp:
+            self.fp = file(self.filename(), "a")
+
+        if not L:
+            if not self.last_line_blank:
+                self.fp.write("\n")
+                self.last_line_blank = True
         else:
-            return os.path.join(LOG_PATH, "%s.chatlog" % self.name)
+            if self.needs_date:
+                self.needs_date = False # avoid recursion
+                self.datestamp()
 
-    def maybe_datestamp(self, t):
-        msgdate = time.localtime(t)
-        lastdate = time.localtime(self.lastMessageTime)
-        if msgdate[0] != lastdate[0]: # year has changed
-            self.close()
-            self.fp = file(self.filename(msgdate[0]), "a")
-        elif t - self.lastMessageTime > 2*3600:
-            self.end_conversation(t)
-#            self.fp.write("___ %s %s\n" % (LEADING_WS, datestamp(t)))
-        elif t - self.lastMessageTime > 15*60:
-            self.fp.write("\n")
+            self.fp.write(L + "\n")
+            self.last_line_blank = False
 
-        self.lastMessageTime = t
+    def filename(self):
+        return os.path.join(LOG_PATH, "%s.chatlog" % self.name)
 
     def read_contents(self):
         ret = [ ]
@@ -71,34 +92,9 @@ class LogConnection:
         
         return ret
 
-    def end_conversation(self, t=None):
-        if t is None:
-            t = self.lastMessageTime
-
-        if self.convStartTime > 0:
-#            if True: # self.numMessages > 10:something:
-#                self.fp.write("--- %s %s - %s (%s)\n\n" % (LEADING_WS, datetimestamp(self.convStartTime), timestamp(self.lastMessageTime), duration(self.lastMessageTime - self.convStartTime)))
-#            else:
-            self.fp.write("\n")
-
-            for daily in range(1, time.localtime(t)[7] - time.localtime(self.lastMessageTime)[7]):
-                self.fp.write("--- %s\n" % (datestamp(self.lastMessageTime + daily * 3600*24)))
-
-        self.convStartTime = t
-
-    def get_stats(self):
-        stats = [ ]
-       
-        for k, v in self.users.items():
-            lines, words, letters, nonwsletters = v
-            stats.append("%s=%s/%s" % (k,lines,words)) # ,letters,nonwsletters))
-
-        self.fp.write("--- %s\n" % "  ".join(stats))
-
     def close(self):
-        self.end_conversation()
         if self.fp:
-            self.fp.write("---\n")
+            self.writeline("---")
             self.fp.close()
         self.fp = None
 

@@ -45,7 +45,7 @@ class Datestamp:
         if g:
             datestr = g.group(1)
             y, month, d = [ int(x) for x in datestr.split("-") ]
-            return Datestamp( (y, month, d, 0, 0, 0) )
+            context.time = (y, month, d, 0, 0, 0)
 
     def serializeLog(self, c):
         return "--- " + datestamp(self.time)
