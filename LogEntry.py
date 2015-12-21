@@ -4,10 +4,15 @@ import re
 
 from User import User
 
-reHMS = "^(\d+:\d+:\d+)"
+reDatestamp = r'^[-_]+ *(\d+-\d+-\d+).*'
+reHMS = r'^(\d+:\d+(?::\d+)?)'
+reMsg = reHMS + r' \[(.*)\] ?(.*)$'
+reRename = reHMS + r' \+* (\S+) was (\S+)'
+reJoin1 = reHMS + r' \** (\S+) \((\S+)\) has joined \S+$'
+reJoin2 = reHMS + r' \+* (\S+) (.*)'
 
 def datestamp(t):
-    return time.strftime("%Y-%m-%d  %A", time.localtime(t)) # %z for timezone
+    return time.strftime("%Y-%m-%d  %A", time.gmtime(t)) # %z for timezone
 
 def datetimestamp(t):
     return time.strftime("%Y-%m-%d  %H:%M:%S", time.localtime(t))
@@ -30,10 +35,15 @@ class LogContext:
 class LogItem:
     @classmethod
     def parse(classtype, line, context):
-        for c in [ Datestamp, ChannelMessage, ChannelJoin ]:
+        for c in [ ChannelMessage, ChannelJoin ]:
             r = c.parse(line, context)
             if r:
                 return r
+
+        if Datestamp.parse(line, context):
+            return None
+
+        return line
         
 class Datestamp:
     def __init__(self, t):
@@ -41,11 +51,14 @@ class Datestamp:
 
     @classmethod
     def parse(classtype, line, context):
-        g = re.match("^--- (\d+-\d+-\d+) ", line)
+        g = re.match(reDatestamp, line)
         if g:
             datestr = g.group(1)
-            y, month, d = [ int(x) for x in datestr.split("-") ]
-            context.time = (y, month, d, 0, 0, 0)
+            tm = time.strptime(datestr, "%Y-%m-%d")
+            t = time.mktime(tm)
+            context.set_time(t)
+
+            return Datestamp(t)
 
     def serializeLog(self, c):
         return "--- " + datestamp(self.time)
@@ -67,15 +80,24 @@ class ChannelMessage:
     @classmethod
     def parse(classtype, line, context):
         """chanmsg = ChannelMessage.parseLog(L)"""
-        g = re.match(reHMS + " \[(.*)\] (.*)$", line)
+        g = re.match(reMsg, line)
         if g:
             timestr,nick,rest = g.groups()
-            t = parseTime(timestr, context.time)
-            return ChannelMessage(t, nick, context.channel, rest)
+            hms = timestr.split(":")
+            t = context.adjustedTime(*hms)
+            return ChannelMessage(t, nick, context.name, rest)
 
     def serializeLog(self, log):
-        y,m,d,h,m,s = time.localtime(self.time)[0:6]
-        return "%s [%s] %s" % (timestamp(self.time, log.emit_seconds), self.src, self.msg)
+        firstLine = True
+        ret = ""
+        for L in self.msg.splitlines():
+            ts = timestamp(self.time, log.emit_seconds)
+            if firstLine:
+                ret += "%s [%s] %s" % (ts, self.src, L)
+                firstLine = False
+            else:
+                ret += "\n...%s %s" % (" " * (len(ts) + len(self.src)), L)
+        return ret
 
     def serializeIRC(self, c):
         return ":%s PRIVMSG #%s :%s" % (self.src, self.dest, self.msg)
@@ -91,15 +113,6 @@ class ChannelMessage:
         <td class="msg"> %(msg)s</td>
         </tr></table>""" % (self.kwargs["classes"], self.time.time_t, self.src, self.msg)
 
-def parseTime(timestr, basetime):
-    h,m,s = timestr.split(":")
-    h = int(h)
-    m = int(m)
-    s = int(s)
-    y,mon,d = basetime[0:3]
-
-    return (y,mon,d,h,m,s)
-
 class ChannelJoin:
     def __init__(self, t, chan, user, nickname):
         self.time = t
@@ -109,15 +122,20 @@ class ChannelJoin:
 
     @classmethod
     def parse(classtype, line, context):
-        g = re.match(reHMS + " \** (\S+) \((\S+)\) has joined (\S+)$", line)
-        if g:
-            timestr, nick, email, channame = g.groups()
-            u = User.find(email)
-            t = parseTime(timestr, context.time)
-            
-            return ChannelJoin(t, channame, u, nick)
-            
+        g = re.match(reJoin1, line)
+        if not g:
+            g = re.match(reJoin2, line)
 
+        if g:
+            timestr, nick, email = g.groups()
+            u = User.find(email)
+            if not u:
+                u = User.create(email)
+            hms = timestr.split(":")
+            t = context.adjustedTime(*hms)
+            
+            return ChannelJoin(t, context.name, u, nick)
+            
     def serializeLog(self, f):
         if self.nickname not in f.users:
             f.users[self.nickname] = self.user
@@ -130,3 +148,5 @@ class ChannelJoin:
     def serializeHTML(self, c):
         return ":%s JOIN :#%s" % (self.nickname, self.channel)
 
+class NickChange:
+    pass

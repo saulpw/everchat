@@ -13,7 +13,7 @@ mynick = 'saul'
 
 rePrivMsg = re.compile(r'(\d+):(\d+) \[msg\(([^\)]+)\)\](.*)')
 reMsg = re.compile(r'(\d+):(\d+) <([^>]+)>(.*)')
-reMe = re.compile(r'(\d+):(\d+) +\* (\S+) (.*)')
+reMe = re.compile(r'(\d+):(\d+) +\* (\S+) ?(.*)')
 reLogOpen = re.compile(r'--- Log opened (.*)')
 reDate = re.compile(r'--- Day changed (.*)')
 reJoin = re.compile(r'(\d+):(\d+) \S+ (\S+) \[~?([^\]]+)\] ([^#]+)#(\S+)')
@@ -79,39 +79,57 @@ def parseIRSSILine(L, out):
             t = out.adjustedTime(hour, minute)
             return ChannelJoin(t, out.name, out.users.get(nick, "was " + nick), newnick)
 
-        print "unparsed:", L
-
+        return L
 
 def main():
     from optparse import OptionParser
     parser = OptionParser()
     parser.add_option("-o", "--output", dest="output")
+    parser.add_option("-a", "--append", action="store_true", dest="append", default=False)
     (options, args) = parser.parse_args()
 
     channame = options.output or os.path.splitext(args[0])[0]
 
-    contents = {}
-
     out = LogConnection.LogConnection(channame, seconds=False)
-    if os.path.exists(out.filename()):
-        print "removing old '%s'" % out.filename()
-        os.remove(out.filename())
+    if args.append:
+        contents = out.read_contents()
+    else:
+        contents = []
 
     for fn in args:
         print fn
         channame = out.name
         msgnum = 0
+
+        ext = os.path.splitext(fn)[1]
     
         for L in file(fn).readlines():
-            obj = parseIRSSILine(L.strip(), out)
-            if obj:
-                msgnum += 1
-                contents[(obj.time, msgnum)] = obj
+            if ext == ".txt":
+                obj = parseAIMLine(L.strip(), out)
+            elif ext == ".log":
+                obj = parseIRSSILine(L.strip(), out)
+            elif ext == ".chatlog" or ext == ".chatlog1":
+                obj = LogItem.parse(L.strip(), out)
+            else:
+                print "unknown ext", ext
+                break
 
-    scontents = sorted(contents.items())
-#    out.set_time(scontents[0][0])
-    for t, v in scontents:
-        out.set_time(t[0])
+            if not obj:
+                pass
+            elif isinstance(obj, str):
+                pass
+                print "unparsed:", obj
+            else:
+                msgnum += 1
+                contents.append( (obj.time, msgnum, obj) )
+
+    if os.path.exists(out.filename()):
+        print "renaming old '%s'" % out.filename()
+        os.rename(out.filename(), out.filename() + ".bak")
+
+    scontents = sorted(contents)
+    out.set_time(scontents[0][0])
+    for t, n, v in scontents:
         out.notify(v)
 
 main()

@@ -17,37 +17,49 @@ class LogConnection:
         self.lastMessageTime = 0
         self.last_line_blank = True
 
-    def adjustedTime(self, hour, minute):
+    def adjustedTime(self, hour, minute, second=None):
         tm = [ x for x in time.localtime(self.contextTime) ]
         tm[3] = int(hour)
         tm[4] = int(minute)
-        return time.mktime(tm)
+        if second is not None:
+            tm[5] = int(second)
+
+        ret = time.mktime(tm)
+        if ret < self.contextTime:
+            # assume next day
+            ret += 3600*24
+            assert ret > self.contextTime
+
+        self.contextTime = ret
+
+        return ret
 
     def notify(self, obj, from_conn=None):
         L = obj.serializeLog(self)
         if L:
-            if isinstance(obj, ChannelMessage):
                 prev = self.lastMessageTime
 
                 # maybe write a datestamp or a newline
                 ndays = int(obj.time - prev) / (3600*24)
+#                assert ndays < 3000
+                if obj.time - prev > 15*60:
+                    self.writeline()
+
                 if ndays > 0 and prev > 0:
                     if ndays > 1:
                         self.writeline("      ... %s days ..." % ndays)
-                elif obj.time - prev > 15*60:
-                    self.writeline()
 
                 if time.localtime(obj.time)[0:3] != time.localtime(prev)[0:3]:
                     assert time.localtime(obj.time)[0:3] > time.localtime(prev)[0:3]
                     self.needs_date = True
 
-                self.writeline(L)
                 self.lastMessageTime = obj.time
-            else:
                 self.writeline(L)
 
+        self.contextTime = obj.time
+
     def datestamp(self, t=None):
-        t = self.contextTime
+        t = max(self.contextTime, self.lastMessageTime)
         self.writeline(Datestamp(t).serializeLog(self))
 
     def set_time(self, t):
@@ -74,18 +86,19 @@ class LogConnection:
 
     def read_contents(self):
         ret = [ ]
-        context = LogContext(self.name, time.gmtime(0))
         try:
+            msgnum = 0
             for L in file(self.filename()).readlines():
                 L = L.strip()
                 if not L: continue
-                p = LogItem.parse(L, context) 
+                p = LogItem.parse(L, self) 
                 if not p:
-                    print("not parsed: %s" % L)
-                elif type(p) is Datestamp:
-                    context.time = p.to_time() # update context only
+                    pass
+                elif isinstance(p, str):
+                    print("unparsed: %s" % L)
                 else:
-                    ret.append(p)
+                    ret.append(( p.time, msgnum, p ))
+                    msgnum += 1
 
         except IOError:
             pass
